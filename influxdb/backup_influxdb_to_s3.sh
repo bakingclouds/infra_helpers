@@ -1,56 +1,63 @@
 #!/bin/bash
 
-# Initialize things
-target_bucket=$1
-timestamp=`date +"%s_%d-%B-%Y_%A@%H%M"`
-backup_tmp="/tmp/"`< /dev/urandom tr -dc "[:alnum:]" | head -c10`
-backup_tar_file="influxdb_backup_$timestamp.tar.gz"
-backup_tar_path="/tmp/"
+function parse_options {
+  function usage() {
+    echo -e >&2 "Usage: $0 dump DATABASE [options...]
+\t-u USERNAME\t(default: root)
+\t-p PASSWORD\t(default: root)
+\t-h HOST\t\t(default: localhost:8086)
+\t-s\t\t(use HTTPS)"
+  }
+  if [ "$#" -lt 2 ]; then
+    usage; exit 1;
+  fi
 
-if [ -z "$1" ]; then
-    echo "Argument containing target S3 bucket path must be passed. Exiting."
-    exit 0
-fi
+  username=root
+  password=root
+  host=localhost:8086
+  https=0
+  shift
+  database=$1
+  shift
 
-command -v aws >/dev/null 2>&1
-if [ $? -ne 0 ]; then
-    echo "AWS CLI not installed. Exiting."
-    exit 0
-fi
+  while getopts u:p:h:s opts
+  do case "${opts}" in
+    u) username="${OPTARG}";;
+    p) password="${OPTARG}";;
+    h) host="${OPTARG}";;
+    s) https=1;;
+    ?) usage; exit 1;;
+    esac
+  done
+  if [ "${https}" -eq 1 ]; then
+    scheme="https"
+  else
+    scheme="http"
+  fi
+}
 
-echo `date +"%d-%B-%Y@%H:%M:%S"`" - Starting backups."
+function dump {
+  parse_options $@
 
-# Backup Metastore
-rm -rf $backup_tmp
-mkdir -p $backup_tmp
-influxd backup $backup_tmp/metastore
+  curl -s -k -G "${scheme}://${host}/db/${database}/series?u=${username}&p=${password}&chunked=true" --data-urlencode "q=select * from /.*/" \
+    | jq . -c -M
+  exit
+}
 
-# List all the databases
-databases=` influx -execute 'show databases' | sed -n -e '/----/,$p' | grep -v -e '----' -e '_internal'`
+function restore {
+  parse_options $@
 
-# Loop the databases
-for db in $databases; do
+  while read -r line
+  do
+    echo >&2 "Writing..."
+    curl -X POST -d "[${line}]" "${scheme}://${host}/db/${database}/series?u=${username}&p=${password}"
+  done
+  exit
+}
 
-  echo `date +"%d-%B-%Y@%H:%M:%S"`" - Backing up database $db to $backup_tmp/$db."
-
-  # Dump
-  influxd backup -database $db $backup_tmp/$db
-
-done;
-
-# Create archive
-echo `date +"%d-%B-%Y@%H:%M:%S"`" - Creating archive /tmp/influxdb_backup_$timestamp."
-cd $backup_tmp
-tar cvzf $backup_tar_path$backup_tar_file .
-
-# Upload
-echo `date +"%d-%B-%Y@%H:%M:%S"`" - Uploading $backup_tar_path$backup_tar_file to $target_bucket/$backup_tar_file."
-aws s3 cp $backup_tar_path$backup_tar_file $target_bucket$backup_tar_file
-
-# Cleanup
-echo `date +"%d-%B-%Y@%H:%M:%S"`" - Cleaning up."
-#rm $backup_tar_path$backup_tar_file
-rm -rf $backup_tmp
-
-# All done
-echo `date +"%d-%B-%Y@%H:%M:%S"`" - All done."
+case "$1" in
+  dump)     dump $@;;
+  restore)  restore $@;;
+  *)      echo >&2 "Usage: $0 [dump|restore] ..."
+    exit 1;;
+esac
